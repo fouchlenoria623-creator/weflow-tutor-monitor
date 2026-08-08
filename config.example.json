@@ -1,0 +1,45 @@
+{
+  "active_hours": {
+    "start": 10,
+    "end": 21
+  },
+  "scan_interval_minutes": 60,
+  "first_run_lookback_hours": 24,
+  "keep_leads_days": 7,
+  "route_limit_per_run": 40,
+  "map_routing_enabled": false,
+  "origin_name": "请改成你的学校或住址",
+  "origin_coord": "",
+  "subject_weights": {
+    "微积分": 46,
+    "数学物理": 44,
+    "数学": 35,
+    "物理": 33,
+    "英语": 14,
+    "语文": 7
+  },
+  "unsupported_subjects": [],
+  "tutor_profile": {
+    "gender": "",
+    "school_tags": [],
+    "school_names": []
+  },
+  "athlete_profile": {},
+  "online_priority_bonus": 35,
+  "online_only_default": false,
+  "priority_only_default": true,
+  "notify_online_only": false,
+  "notification_include_address": false,
+  "notify_tiers": [
+    "线上优先",
+    "优先投"
+  ],
+  "include_name_patterns": [
+    "家教",
+    "接单"
+  ],
+  "include_group_ids": [],
+  "exclude_group_ids": [],
+  "include_groups": {},
+  "group_reports": []
+}

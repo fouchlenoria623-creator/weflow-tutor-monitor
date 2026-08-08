@@ -1,0 +1,38 @@
+# Private runtime data
+/config.local.json
+/state/
+/reports/
+/logs/
+/work/
+/demo-output/
+/outputs/
+/家教群本地标签.csv
+
+# Credentials and local configuration
+.env
+.env.*
+!.env.example
+WeFlow-config.json
+*WeFlow-config*.json
+
+# Imported private files
+*.xlsx
+*.xls
+*.lnk
+*.bak
+*.tmp
+
+# Python and tooling
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+.playwright-cli/
+
+# Editors and operating systems
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
