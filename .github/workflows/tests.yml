@@ -1,0 +1,62 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        python-version: ['3.10', '3.11', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Compile
+        run: python -m compileall -q .
+      - name: Unit tests
+        run: python -m unittest discover -v -p "test_*.py"
+      - name: Build synthetic dashboard
+        if: matrix.python-version == '3.12'
+        run: python demo.py --out-dir "$env:RUNNER_TEMP\weflow-demo"
+      - name: Load synthetic dashboard in Google Chrome
+        if: matrix.python-version == '3.12'
+        shell: powershell
+        run: |
+          $chrome = "$env:ProgramFiles\Google\Chrome\Application\chrome.exe"
+          if (-not (Test-Path -LiteralPath $chrome)) { throw 'Google Chrome is not installed on windows-latest.' }
+          $html = Join-Path $env:RUNNER_TEMP 'weflow-demo\latest.html'
+          $uri = ([System.Uri](Resolve-Path -LiteralPath $html).Path).AbsoluteUri
+          $profile = Join-Path $env:RUNNER_TEMP 'weflow-chrome-profile'
+          $stdout = Join-Path $env:RUNNER_TEMP 'weflow-dashboard-dom.html'
+          $stderr = Join-Path $env:RUNNER_TEMP 'weflow-dashboard-chrome.log'
+          $arguments = @(
+            '--headless=new', '--disable-gpu', '--no-first-run', '--no-default-browser-check',
+            "--user-data-dir=$profile", '--dump-dom', $uri
+          )
+          $process = Start-Process -FilePath $chrome -ArgumentList $arguments -Wait -PassThru `
+            -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+          if ($process.ExitCode -ne 0) { Get-Content $stderr; exit $process.ExitCode }
+          $dom = Get-Content -Raw -Encoding UTF8 -LiteralPath $stdout
+          foreach ($marker in @('DEMO1001', 'id="orders"', 'id="columnButton"', 'data-keyword="DEMO1001"')) {
+            if (-not $dom.Contains($marker)) { throw "Chrome DOM smoke test missed marker: $marker" }
+          }
+      - name: Privacy gate
+        run: python tools/privacy_check.py
+      - name: Parse PowerShell scripts
+        shell: powershell
+        run: |
+          $allErrors = @()
+          Get-ChildItem -Filter *.ps1 | ForEach-Object {
+            $tokens = $null
+            $parseErrors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$tokens, [ref]$parseErrors)
+            $allErrors += $parseErrors
+          }
+          if ($allErrors.Count) { $allErrors | Format-List; exit 1 }
