@@ -6,6 +6,12 @@ import sys
 from pathlib import Path
 
 
+for stream in (sys.stdout, sys.stderr):
+    reconfigure = getattr(stream, "reconfigure", None)
+    if reconfigure is not None:
+        reconfigure(encoding="utf-8", errors="backslashreplace")
+
+
 ROOT = Path(__file__).resolve().parents[1]
 SKIP_DIRS = {".git", ".venv", "state", "reports", "logs", "work", "demo-output", "__pycache__"}
 TEXT_SUFFIXES = {".py", ".ps1", ".json", ".csv", ".html", ".md", ".yml", ".yaml", ".txt"}
