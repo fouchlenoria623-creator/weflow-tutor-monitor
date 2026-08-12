@@ -25,6 +25,7 @@ class BaiduRouteTests(unittest.TestCase):
         ranker._route_attempt_results.clear()
         ranker.ORIGIN_NAME = "示例出发地"
         ranker.ORIGIN_COORD = "116,40"
+        ranker.MAP_PROVIDER = "baidu"
 
     def test_baidu_get_uses_the_global_request_slot(self):
         response = mock.MagicMock()
@@ -92,7 +93,8 @@ class BaiduRouteTests(unittest.TestCase):
 
         self.assertIsNone(result)
         self.assertEqual(request.call_count, 1)
-        self.assertIn("outside_beijing", cache["geo_mismatch:武汉市东西湖区"])
+        mismatch_key = ranker.geocode_cache_key("武汉市东西湖区", "baidu", "mismatch")
+        self.assertIn("outside_beijing", cache[mismatch_key])
 
     def test_live_baidu_refreshes_legacy_estimate(self):
         old_estimate = {
@@ -229,6 +231,178 @@ class BaiduRouteTests(unittest.TestCase):
         self.assertEqual(len(routed_orders), 1)
         self.assertEqual(route_orders.call_args.args[1], 0)
         self.assertTrue(routed_orders[0]["posted_at"].startswith(today))
+
+
+class AmapRouteTests(unittest.TestCase):
+    def setUp(self):
+        ranker._route_attempt_results.clear()
+        ranker.ORIGIN_NAME = "示例出发地"
+        ranker.ORIGIN_COORD = "116,40"
+        ranker.MAP_PROVIDER = "amap"
+
+    def tearDown(self):
+        ranker.MAP_PROVIDER = "baidu"
+
+    def test_amap_get_uses_its_request_slot(self):
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.read.return_value = b'{"status":"1","infocode":"10000"}'
+        slot = mock.MagicMock()
+
+        with mock.patch.object(ranker, "_amap_request_slot", return_value=slot) as request_slot:
+            with mock.patch.object(ranker.urllib.request, "urlopen", return_value=response) as urlopen:
+                result = ranker.amap_get("https://restapi.amap.com/test", {"key": "test-key"})
+
+        request_slot.assert_called_once_with()
+        slot.__enter__.assert_called_once_with()
+        slot.__exit__.assert_called_once()
+        urlopen.assert_called_once()
+        self.assertEqual(result["infocode"], "10000")
+
+    def test_amap_daily_quota_error_is_not_retried(self):
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.read.return_value = b'{"status":"0","infocode":"10003"}'
+
+        with mock.patch.object(ranker, "_amap_request_slot", return_value=mock.MagicMock()):
+            with mock.patch.object(ranker.urllib.request, "urlopen", return_value=response) as urlopen:
+                result = ranker.amap_get("https://restapi.amap.com/test", {"key": "test-key"})
+
+        urlopen.assert_called_once()
+        self.assertEqual(result["infocode"], "10003")
+
+    def test_amap_rate_limit_error_is_not_retried(self):
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.read.return_value = b'{"status":"0","infocode":"10014"}'
+
+        with mock.patch.object(ranker, "_amap_request_slot", return_value=mock.MagicMock()):
+            with mock.patch.object(ranker.urllib.request, "urlopen", return_value=response) as urlopen:
+                result = ranker.amap_get("https://restapi.amap.com/test", {"key": "test-key"})
+
+        urlopen.assert_called_once()
+        self.assertEqual(result["infocode"], "10014")
+
+    def test_amap_v5_coordinates_cost_and_response_parsing(self):
+        responses = [
+            {
+                "status": "1",
+                "infocode": "10000",
+                "geocodes": [{
+                    "location": f"{116.4:.4f},{39.9:.4f}",
+                    "district": "海淀区",
+                    "level": "兴趣点",
+                }],
+            },
+            {
+                "status": "1",
+                "infocode": "10000",
+                "route": {
+                    "taxi_cost": "42.5",
+                    "paths": [{"distance": "12345", "cost": {"duration": "1800"}}],
+                },
+            },
+        ]
+        calls = []
+
+        def fake_get(url, params):
+            calls.append((url, params))
+            return responses.pop(0)
+
+        cache = {}
+        with mock.patch.object(ranker, "amap_get", side_effect=fake_get):
+            result = ranker.amap_route("海淀区测试路10号", "test-key", cache)
+
+        self.assertEqual(calls[0][0], "https://restapi.amap.com/v3/geocode/geo")
+        self.assertEqual(calls[1][0], "https://restapi.amap.com/v5/direction/driving")
+        self.assertEqual(calls[1][1]["origin"], f"{116.0:.6f},{40.0:.6f}")
+        self.assertEqual(calls[1][1]["destination"], f"{116.4:.6f},{39.9:.6f}")
+        self.assertEqual(calls[1][1]["show_fields"], "cost")
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["one_km"], 12.3)
+        self.assertEqual(result["one_min"], 30)
+        self.assertEqual(result["one_taxi"], 42.5)
+        self.assertFalse(result["taxi_estimated"])
+        self.assertEqual(result["route_provider"], "amap_v5_driving")
+        self.assertEqual(result["cache_provider"], "amap")
+
+    def test_amap_geocode_cache_isolated_by_provider_and_origin(self):
+        address = "海淀区测试路10号"
+        first = ranker.geocode_cache_key(address, "amap")
+        baidu = ranker.geocode_cache_key(address, "baidu")
+        ranker.ORIGIN_COORD = "116.5,39.95"
+        moved = ranker.geocode_cache_key(address, "amap")
+
+        self.assertNotEqual(first, baidu)
+        self.assertNotEqual(first, moved)
+
+    def test_amap_rejects_geocode_outside_beijing(self):
+        response = {
+            "status": "1",
+            "infocode": "10000",
+            "geocodes": [{"location": f"{114.3:.4f},{30.6:.4f}", "district": ""}],
+        }
+        cache = {}
+        with mock.patch.object(ranker, "amap_get", return_value=response):
+            result = ranker.amap_geocode("外地测试地址", "test-key", cache)
+
+        self.assertIsNone(result)
+        mismatch_key = ranker.geocode_cache_key("外地测试地址", "amap", "mismatch")
+        self.assertIn("outside_beijing", cache[mismatch_key])
+
+    def test_selected_amap_provider_never_falls_back_to_baidu(self):
+        candidate = order("海淀区测试路10号", 100)
+        amap_result = {
+            "status": "ok",
+            "one_km": 5.0,
+            "round_km": 10.0,
+            "one_min": 20,
+            "round_min": 40,
+            "route_provider": "amap_v5_driving",
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            cache_path = Path(directory) / "routes.json"
+            with mock.patch.dict(os.environ, {"AMAP_KEY": "amap-key", "BAIDU_MAP_AK": "baidu-key"}, clear=False):
+                with mock.patch.object(ranker, "amap_route", return_value=amap_result) as amap_live:
+                    with mock.patch.object(ranker, "baidu_route") as baidu_live:
+                        ranker.route_orders([candidate], 1, cache_path)
+
+        amap_live.assert_called_once_with("海淀区测试路10号", "amap-key", mock.ANY)
+        baidu_live.assert_not_called()
+        self.assertEqual(candidate["route"]["cache_provider"], "amap")
+
+    def test_missing_amap_key_does_not_use_available_baidu_key(self):
+        candidate = order("海淀区测试路10号", 100)
+
+        with tempfile.TemporaryDirectory() as directory:
+            cache_path = Path(directory) / "routes.json"
+            with mock.patch.dict(os.environ, {"AMAP_KEY": "", "BAIDU_MAP_AK": "baidu-key"}, clear=False):
+                with mock.patch.object(ranker, "amap_route") as amap_live:
+                    with mock.patch.object(ranker, "baidu_route") as baidu_live:
+                        routed = ranker.route_orders([candidate], 1, cache_path)
+
+        self.assertEqual(routed, 0)
+        amap_live.assert_not_called()
+        baidu_live.assert_not_called()
+        self.assertNotIn("route", candidate)
+
+    def test_amap_quota_failure_is_not_persisted(self):
+        candidate = order("海淀区测试路10号", 100)
+        failed = {
+            "status": "route_failed",
+            "infocode": "10003",
+            "route_provider": "amap",
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            cache_path = Path(directory) / "routes.json"
+            with mock.patch.dict(os.environ, {"AMAP_KEY": "amap-key"}, clear=False):
+                with mock.patch.object(ranker, "amap_route", return_value=failed):
+                    ranker.route_orders([candidate], 1, cache_path)
+            cache = json.loads(cache_path.read_text(encoding="utf-8"))
+
+        self.assertNotIn(ranker.route_cache_key("海淀区测试路10号", "amap"), cache)
 
 if __name__ == "__main__":
     unittest.main()

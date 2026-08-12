@@ -41,6 +41,7 @@ DEFAULT_CONFIG = {
     "keep_leads_days": 7,
     "route_limit_per_run": 40,
     "map_routing_enabled": False,
+    "map_provider": "baidu",
     "origin_name": "",
     "origin_coord": "",
     "subject_weights": {},
@@ -107,6 +108,10 @@ def load_config(path: Path = CONFIG_PATH, *, require_origin=True):
         raise ValueError("tutor_profile.gender 只能是 male、female 或空字符串")
     if not isinstance(config.get("map_routing_enabled"), bool):
         raise ValueError("map_routing_enabled 必须是 true 或 false")
+    provider = str(config.get("map_provider") or "baidu").strip().lower()
+    if provider not in ranker.MAP_KEY_ENV:
+        raise ValueError("map_provider 只能是 amap 或 baidu")
+    config["map_provider"] = provider
     coord = str(config.get("origin_coord") or "").strip()
     if (require_origin and config.get("map_routing_enabled")) or coord:
         try:
@@ -809,7 +814,8 @@ def main(argv=None):
             "message_schema_probe_ok": message_probe_ok,
             "output_directories_ready": True,
             "map_routing_enabled": bool(config.get("map_routing_enabled")),
-            "map_key_configured": bool(os.environ.get("BAIDU_MAP_AK")),
+            "map_provider": config["map_provider"],
+            "map_key_configured": bool(os.environ.get(ranker.MAP_KEY_ENV[config["map_provider"]])),
         }, ensure_ascii=False, indent=2))
         return 0
 

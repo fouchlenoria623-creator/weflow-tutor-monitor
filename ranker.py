@@ -19,6 +19,7 @@ from pathlib import Path
 TODAY = datetime.now().strftime("%Y-%m-%d")
 ORIGIN_NAME = os.environ.get("TUTOR_ORIGIN_NAME", "未配置出发地")
 ORIGIN_COORD = os.environ.get("TUTOR_ORIGIN_COORD", "")
+MAP_PROVIDER = "baidu"
 SUBJECT_SCORE_OVERRIDES = {}
 TUTOR_PROFILE = {
     "gender": "",
@@ -26,20 +27,22 @@ TUTOR_PROFILE = {
     "school_names": [],
 }
 _route_attempt_results = {}
-_baidu_thread_lock = threading.Lock()
-_baidu_mutex_name = r"Global\WeFlowTutorBaiduApi"
-_baidu_mutex_timeout_ms = 120_000
-_baidu_request_cooldown_seconds = 0.35
+_map_thread_lock = threading.Lock()
+_map_mutex_timeout_ms = 120_000
+_map_request_cooldown_seconds = 0.35
+MAP_KEY_ENV = {"baidu": "BAIDU_MAP_AK", "amap": "AMAP_KEY"}
 
 FILES = []
 
 
 def configure_runtime(config):
     """Apply local profile settings without persisting private values in source."""
-    global ORIGIN_NAME, ORIGIN_COORD, SUBJECT_SCORE_OVERRIDES, TUTOR_PROFILE
+    global ORIGIN_NAME, ORIGIN_COORD, MAP_PROVIDER, SUBJECT_SCORE_OVERRIDES, TUTOR_PROFILE
 
     ORIGIN_NAME = str(config.get("origin_name") or ORIGIN_NAME)
     ORIGIN_COORD = str(config.get("origin_coord") or ORIGIN_COORD)
+    if "map_provider" in config:
+        MAP_PROVIDER = str(config.get("map_provider") or "baidu").strip().lower()
     raw_weights = config.get("subject_weights") or {}
     SUBJECT_SCORE_OVERRIDES = {
         str(name): float(weight)
@@ -1013,14 +1016,15 @@ def save_cache(path: Path, cache):
 
 
 @contextmanager
-def _baidu_request_slot():
-    """Serialize live Baidu requests across threads and Windows sessions."""
-    with _baidu_thread_lock:
+def _map_request_slot(provider):
+    """Serialize live requests per provider across threads and Windows sessions."""
+    provider_name = str(provider or "map").strip().title()
+    with _map_thread_lock:
         if os.name != "nt":
             try:
                 yield
             finally:
-                time.sleep(_baidu_request_cooldown_seconds)
+                time.sleep(_map_request_cooldown_seconds)
             return
 
         import ctypes
@@ -1039,25 +1043,37 @@ def _baidu_request_slot():
         close_handle.argtypes = (ctypes.c_void_p,)
         close_handle.restype = ctypes.c_bool
 
-        handle = create_mutex(None, False, _baidu_mutex_name)
+        handle = create_mutex(None, False, rf"Global\WeFlowTutor{provider_name}Api")
         if not handle:
             raise ctypes.WinError(ctypes.get_last_error())
         acquired = False
         try:
-            wait_status = wait_for_single_object(handle, _baidu_mutex_timeout_ms)
+            wait_status = wait_for_single_object(handle, _map_mutex_timeout_ms)
             if wait_status not in (0x00000000, 0x00000080):
                 if wait_status == 0x00000102:
-                    raise TimeoutError("Timed out waiting for the Baidu API request slot")
+                    raise TimeoutError(f"Timed out waiting for the {provider_name} API request slot")
                 raise OSError(f"WaitForSingleObject failed with status {wait_status}")
             acquired = True
             try:
                 yield
             finally:
-                time.sleep(_baidu_request_cooldown_seconds)
+                time.sleep(_map_request_cooldown_seconds)
         finally:
             if acquired:
                 release_mutex(handle)
             close_handle(handle)
+
+
+@contextmanager
+def _baidu_request_slot():
+    with _map_request_slot("baidu"):
+        yield
+
+
+@contextmanager
+def _amap_request_slot():
+    with _map_request_slot("amap"):
+        yield
 
 
 def baidu_get(url, params):
@@ -1082,6 +1098,27 @@ def baidu_get(url, params):
         if status in (1, 401) and attempt < 3:
             time.sleep(0.8 * (attempt + 1))
             continue
+        return data
+    if last_error:
+        raise last_error
+    return data
+
+
+def amap_get(url, params):
+    query = urllib.parse.urlencode(params)
+    req = urllib.request.Request(url + "?" + query, headers={"User-Agent": "CodexTutorRank/1.0"})
+    last_error = None
+    for attempt in range(4):
+        try:
+            with _amap_request_slot():
+                with urllib.request.urlopen(req, timeout=12) as resp:
+                    data = json.loads(resp.read().decode("utf-8", errors="replace"))
+        except OSError as exc:
+            last_error = exc
+            time.sleep(0.8 * (attempt + 1))
+            continue
+        # Do not retry API-level QPS, quota, permission or server-busy errors
+        # within the same run. A tight retry loop can worsen throttling.
         return data
     if last_error:
         raise last_error
@@ -1134,6 +1171,16 @@ def route_cache_key(address, provider):
     return f"route:{provider_name}:{normalized_origin_coord()}:{str(address).strip()}"
 
 
+def geocode_cache_key(address, provider, field="location"):
+    provider_name = str(provider or "unknown").strip().lower()
+    return f"geo:{provider_name}:{normalized_origin_coord()}:{field}:{str(address).strip()}"
+
+
+def clear_geocode_cache(cache, address, provider):
+    for field in ("location", "source", "district", "mismatch", "confidence", "precise", "comprehension", "level"):
+        cache.pop(geocode_cache_key(address, provider, field), None)
+
+
 def with_route_context(route_data, provider):
     result = dict(route_data or {})
     result["cache_provider"] = str(provider or "unknown").strip().lower()
@@ -1151,9 +1198,13 @@ def reusable_route(address, route_data, live_provider="", expected_provider=""):
             return False
     if not route_cache_plausible(address, route_data):
         return False
-    # Replace legacy straight-line estimates once a live Baidu key is available.
-    if live_provider == "baidu" and route_data.get("status") == "estimated":
-        return route_data.get("route_provider") == "baidu_directionlite"
+    # Refresh legacy or other-provider estimates once the selected provider is live.
+    if live_provider and route_data.get("status") == "estimated":
+        expected_route_provider = {
+            "baidu": "baidu_directionlite",
+            "amap": "amap_v5_driving",
+        }.get(str(live_provider).strip().lower())
+        return route_data.get("route_provider") == expected_route_provider
     return True
 
 
@@ -1167,10 +1218,11 @@ def _utf8_prefix(value, max_bytes):
 
 
 def baidu_geocode(address, ak, cache):
-    ckey = "geo:" + address
+    ckey = geocode_cache_key(address, "baidu")
+    district_key = geocode_cache_key(address, "baidu", "district")
     expected_district = requested_district(address)
     if cache.get(ckey):
-        cached_district = cache.get("geo_district:" + address, "")
+        cached_district = cache.get(district_key, "")
         if not cached_district or district_matches(expected_district, cached_district):
             return cache[ckey]
         cache.pop(ckey, None)
@@ -1200,7 +1252,7 @@ def baidu_geocode(address, ak, cache):
     if isinstance(poi_infos, list) and poi_infos and isinstance(poi_infos[0], dict):
         returned_district = str(poi_infos[0].get("district") or "")
     if returned_district and not district_matches(expected_district, returned_district):
-        cache["geo_mismatch:" + address] = returned_district
+        cache[geocode_cache_key(address, "baidu", "mismatch")] = returned_district
         return None
 
     try:
@@ -1211,17 +1263,68 @@ def baidu_geocode(address, ak, cache):
     if not (-180 <= longitude <= 180 and -90 <= latitude <= 90):
         return None
     if not _inside_beijing(longitude, latitude):
-        cache["geo_mismatch:" + address] = f"outside_beijing:{longitude:.6f},{latitude:.6f}"
+        cache[geocode_cache_key(address, "baidu", "mismatch")] = f"outside_beijing:{longitude:.6f},{latitude:.6f}"
         return None
 
     loc = f"{longitude:.6f},{latitude:.6f}"
     cache[ckey] = loc
-    cache["geo_source:" + address] = "baidu_geocode"
-    cache["geo_district:" + address] = returned_district or expected_district
-    cache["geo_confidence:" + address] = result.get("confidence")
-    cache["geo_precise:" + address] = result.get("precise")
-    cache["geo_comprehension:" + address] = result.get("comprehension")
-    cache["geo_level:" + address] = result.get("level")
+    cache[geocode_cache_key(address, "baidu", "source")] = "baidu_geocode"
+    cache[district_key] = returned_district or expected_district
+    cache[geocode_cache_key(address, "baidu", "confidence")] = result.get("confidence")
+    cache[geocode_cache_key(address, "baidu", "precise")] = result.get("precise")
+    cache[geocode_cache_key(address, "baidu", "comprehension")] = result.get("comprehension")
+    cache[geocode_cache_key(address, "baidu", "level")] = result.get("level")
+    return loc
+
+
+def _text_field(value):
+    if isinstance(value, list):
+        return str(value[0]) if value else ""
+    return str(value or "")
+
+
+def amap_geocode(address, key, cache):
+    ckey = geocode_cache_key(address, "amap")
+    district_key = geocode_cache_key(address, "amap", "district")
+    expected_district = requested_district(address)
+    if cache.get(ckey):
+        cached_district = cache.get(district_key, "")
+        if not cached_district or district_matches(expected_district, cached_district):
+            return cache[ckey]
+        cache.pop(ckey, None)
+
+    lookup_address = re.split(r"[】#]|坐地铁|倒公交|公交路线|地铁路线", address, maxsplit=1)[0].strip(" ,，")
+    structured = lookup_address if "北京" in lookup_address else "北京市" + lookup_address
+    data = amap_get("https://restapi.amap.com/v3/geocode/geo", {
+        "key": key,
+        "address": _utf8_prefix(structured, 128),
+        "city": "北京市",
+        "output": "JSON",
+    })
+    geocodes = data.get("geocodes") if isinstance(data.get("geocodes"), list) else []
+    if str(data.get("status") or "") != "1" or not geocodes or not isinstance(geocodes[0], dict):
+        return None
+
+    geocode = geocodes[0]
+    returned_district = _text_field(geocode.get("district"))
+    if returned_district and not district_matches(expected_district, returned_district):
+        cache[geocode_cache_key(address, "amap", "mismatch")] = returned_district
+        return None
+    try:
+        longitude, latitude = map(float, str(geocode.get("location") or "").split(",", 1))
+    except (TypeError, ValueError):
+        return None
+    if not (-180 <= longitude <= 180 and -90 <= latitude <= 90):
+        return None
+    if not _inside_beijing(longitude, latitude):
+        cache[geocode_cache_key(address, "amap", "mismatch")] = f"outside_beijing:{longitude:.6f},{latitude:.6f}"
+        return None
+
+    loc = f"{longitude:.6f},{latitude:.6f}"
+    cache[ckey] = loc
+    cache[geocode_cache_key(address, "amap", "source")] = "amap_geocode_v3"
+    cache[district_key] = returned_district or expected_district
+    cache[geocode_cache_key(address, "amap", "level")] = _text_field(geocode.get("level"))
     return loc
 
 
@@ -1274,9 +1377,7 @@ def baidu_route(address, ak, cache):
         return cached_route
     if ckey in cache:
         cache.pop(ckey, None)
-        cache.pop("geo:" + address, None)
-        cache.pop("geo_source:" + address, None)
-        cache.pop("geo_district:" + address, None)
+        clear_geocode_cache(cache, address, "baidu")
 
     dest = baidu_geocode(address, ak, cache)
     if not dest:
@@ -1301,7 +1402,7 @@ def baidu_route(address, ak, cache):
         fallback = estimate_route_from_dest(dest, info)
         if fallback:
             fallback["route_provider"] = "baidu_directionlite"
-            fallback["geocode_source"] = cache.get("geo_source:" + address, "baidu_cache")
+            fallback["geocode_source"] = cache.get(geocode_cache_key(address, "baidu", "source"), "baidu_cache")
             fallback = with_route_context(fallback, "baidu")
             cache[ckey] = fallback
             return fallback
@@ -1318,7 +1419,7 @@ def baidu_route(address, ak, cache):
         fallback = estimate_route_from_dest(dest, "invalid_route_metrics")
         if fallback:
             fallback["route_provider"] = "baidu_directionlite"
-            fallback["geocode_source"] = cache.get("geo_source:" + address, "baidu_cache")
+            fallback["geocode_source"] = cache.get(geocode_cache_key(address, "baidu", "source"), "baidu_cache")
             fallback = with_route_context(fallback, "baidu")
             cache[ckey] = fallback
             return fallback
@@ -1337,8 +1438,84 @@ def baidu_route(address, ak, cache):
         "round_taxi": round(one_taxi * 2, 1),
         "taxi_estimated": True,
         "route_provider": "baidu_directionlite",
-        "geocode_source": cache.get("geo_source:" + address, "baidu_cache"),
+        "geocode_source": cache.get(geocode_cache_key(address, "baidu", "source"), "baidu_cache"),
     }, "baidu")
+    cache[ckey] = result
+    return result
+
+
+def amap_route(address, key, cache):
+    if not address:
+        return {"status": "missing_address"}
+    if "线上" in address:
+        return {"status": "online", "one_km": 0, "round_km": 0, "one_min": 0, "round_min": 0, "one_taxi": 0, "round_taxi": 0}
+
+    ckey = route_cache_key(address, "amap")
+    if ckey in cache and reusable_route(address, cache[ckey], "amap", "amap"):
+        return cache[ckey]
+    if ckey in cache:
+        cache.pop(ckey, None)
+        clear_geocode_cache(cache, address, "amap")
+
+    dest = amap_geocode(address, key, cache)
+    if not dest:
+        return {"status": "geocode_failed", "route_provider": "amap"}
+    data = amap_get("https://restapi.amap.com/v5/direction/driving", {
+        "key": key,
+        "origin": normalized_origin_coord(),
+        "destination": dest,
+        "strategy": 32,
+        "show_fields": "cost",
+        "output": "JSON",
+    })
+    route = data.get("route") if isinstance(data.get("route"), dict) else {}
+    paths = route.get("paths") if isinstance(route.get("paths"), list) else []
+    if str(data.get("status") or "") != "1" or not paths:
+        info = str(data.get("info") or data.get("infocode") or "route_failed")
+        return {
+            "status": "route_failed",
+            "dest": dest,
+            "info": info,
+            "infocode": str(data.get("infocode") or ""),
+            "route_provider": "amap",
+        }
+
+    selected = paths[0] if isinstance(paths[0], dict) else {}
+    cost = selected.get("cost") if isinstance(selected.get("cost"), dict) else {}
+    try:
+        distance_m = float(selected.get("distance") or 0)
+        duration_s = float(cost.get("duration") or selected.get("duration") or 0)
+    except (TypeError, ValueError):
+        distance_m = 0
+        duration_s = 0
+    if distance_m <= 0 or duration_s <= 0:
+        return {
+            "status": "route_failed",
+            "dest": dest,
+            "info": "invalid_route_metrics",
+            "route_provider": "amap",
+        }
+
+    one_km = round(distance_m / 1000.0, 1)
+    try:
+        provider_taxi = float(route.get("taxi_cost") or 0)
+    except (TypeError, ValueError):
+        provider_taxi = 0
+    taxi_estimated = provider_taxi <= 0
+    one_taxi = round(provider_taxi, 1) if provider_taxi > 0 else estimate_one_way_taxi(one_km)
+    result = with_route_context({
+        "status": "ok",
+        "dest": dest,
+        "one_km": one_km,
+        "round_km": round(distance_m * 2 / 1000.0, 1),
+        "one_min": round(duration_s / 60.0),
+        "round_min": round(duration_s * 2 / 60.0),
+        "one_taxi": one_taxi,
+        "round_taxi": round(one_taxi * 2, 1),
+        "taxi_estimated": taxi_estimated,
+        "route_provider": "amap_v5_driving",
+        "geocode_source": cache.get(geocode_cache_key(address, "amap", "source"), "amap_cache"),
+    }, "amap")
     cache[ckey] = result
     return result
 
@@ -1361,10 +1538,12 @@ def is_online_order(order):
 
 
 def route_orders(orders, limit, cache_path):
-    baidu_key = str(os.environ.get("BAIDU_MAP_AK") or "").strip()
-    provider = "baidu"
-    live_provider = provider if baidu_key else ""
-    key = baidu_key
+    provider = str(MAP_PROVIDER or "baidu").strip().lower()
+    if provider not in MAP_KEY_ENV:
+        raise ValueError("map_provider 只能是 amap 或 baidu")
+    key = str(os.environ.get(MAP_KEY_ENV[provider]) or "").strip()
+    live_provider = provider if key else ""
+    route_function = {"baidu": baidu_route, "amap": amap_route}[provider]
     cache = load_cache(cache_path)
     candidates = [o for o in orders if not o.get("hard_reasons") and (o.get("address") or is_online_order(o))]
     routed = 0
@@ -1406,7 +1585,7 @@ def route_orders(orders, limit, cache_path):
         for address, group in unresolved[:limit]:
             ckey = route_cache_key(address, provider)
             try:
-                result = baidu_route(address, key, cache)
+                result = route_function(address, key, cache)
             except Exception as exc:
                 result = {"status": "error", "error": str(exc), "route_provider": provider}
             result = with_route_context(result, provider)
@@ -1739,14 +1918,19 @@ def main():
         "--route-limit",
         type=int,
         default=0,
-        help="新线下地址的地图上限；大于 0 且配置 BAIDU_MAP_AK 时会向百度发送地址",
+        help="新线下地址的地图上限；大于 0 且配置所选供应商 Key 时会向该地图服务发送地址",
     )
+    parser.add_argument("--map-provider", choices=("amap", "baidu"), default="baidu")
     parser.add_argument("--origin-name", default=ORIGIN_NAME)
     parser.add_argument("--origin-coord", default=ORIGIN_COORD, help="GCJ-02 经度,纬度")
     args = parser.parse_args()
 
     TODAY = args.date
-    configure_runtime({"origin_name": args.origin_name, "origin_coord": args.origin_coord})
+    configure_runtime({
+        "origin_name": args.origin_name,
+        "origin_coord": args.origin_coord,
+        "map_provider": args.map_provider,
+    })
     input_files = args.input or FILES
     if not input_files:
         parser.error("请至少提供一个 --input 文件；实时监控请运行 monitor.py")

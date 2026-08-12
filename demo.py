@@ -13,6 +13,7 @@ DEMO_DATE = "2026-01-01"
 DEMO_CONFIG = {
     **monitor.DEFAULT_CONFIG,
     "map_routing_enabled": False,
+    "map_provider": "baidu",
     "origin_name": "合成出发地",
     "origin_coord": "",
     "subject_weights": {"数学物理": 44, "数学": 35, "物理": 33, "英语": 14},

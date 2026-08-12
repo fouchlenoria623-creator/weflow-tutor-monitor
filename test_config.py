@@ -26,7 +26,24 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(60, config["scan_interval_minutes"])
         self.assertEqual("示例出发地", config["origin_name"])
         self.assertFalse(config["map_routing_enabled"])
+        self.assertEqual("baidu", config["map_provider"])
         self.assertFalse(config["notification_include_address"])
+
+    def test_example_explicitly_recommends_amap_but_keeps_routing_disabled(self):
+        example = json.loads((Path(__file__).resolve().parent / "config.example.json").read_text(encoding="utf-8"))
+
+        self.assertEqual("amap", example["map_provider"])
+        self.assertFalse(example["map_routing_enabled"])
+
+    def test_invalid_map_provider_is_rejected(self):
+        data = {
+            "map_provider": "other",
+            "map_routing_enabled": False,
+            "include_name_patterns": ["家教"],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, "map_provider"):
+                monitor.load_config(self.write_config(directory, data))
 
     def test_invalid_coordinate_is_rejected(self):
         data = {"origin_coord": "请填写", "include_name_patterns": ["家教"]}

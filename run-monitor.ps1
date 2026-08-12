@@ -33,8 +33,14 @@ if (Test-Path -LiteralPath $venvPython) {
     exit 2
 }
 
-$baiduMapAk = [Environment]::GetEnvironmentVariable('BAIDU_MAP_AK', 'User')
-if ($baiduMapAk) { $env:BAIDU_MAP_AK = $baiduMapAk }
+$mapProvider = if ($settings.map_provider) { [string]$settings.map_provider } else { 'baidu' }
+if ($mapProvider.ToLowerInvariant() -eq 'amap') {
+    $amapKey = [Environment]::GetEnvironmentVariable('AMAP_KEY', 'User')
+    if ($amapKey) { $env:AMAP_KEY = $amapKey }
+} elseif ($mapProvider.ToLowerInvariant() -eq 'baidu') {
+    $baiduMapAk = [Environment]::GetEnvironmentVariable('BAIDU_MAP_AK', 'User')
+    if ($baiduMapAk) { $env:BAIDU_MAP_AK = $baiduMapAk }
+}
 $hour = (Get-Date).Hour
 if (-not $Force -and ($hour -lt $startHour -or $hour -gt $endHour)) {
     "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] skipped outside ${startHour}:00-${endHour}:59" |

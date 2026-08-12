@@ -8,6 +8,7 @@
   "keep_leads_days": 7,
   "route_limit_per_run": 40,
   "map_routing_enabled": false,
+  "map_provider": "amap",
   "origin_name": "请改成你的学校或住址",
   "origin_coord": "",
   "subject_weights": {

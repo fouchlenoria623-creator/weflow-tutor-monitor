@@ -32,7 +32,7 @@ flowchart LR
 - 合并跨群重复转发，保留来源群信息
 - 识别线上单，并给线上单独立优先级
 - 根据科目、年级、表面时薪、信息费、频次和通勤计算综合分
-- 可选百度地图地理编码和驾车路线，估算单程距离、时间、车费及净时薪
+- 可选高德或百度地图地理编码和驾车路线，估算单程距离、时间、车费及净时薪
 - 按性别、院校、在职老师、住家、无法教授的科目等条件过滤
 - 深色 HTML 报告支持搜索、模式/级别筛选、隐藏列、固定表头和点击表头排序
 - Windows 计划任务按配置自动运行，互斥锁防止重复实例
@@ -50,7 +50,7 @@ flowchart LR
 - 实时模式需要你已合法配置的兼容 WeFlow 本地 API；演示和手动 Markdown 模式不需要
 - PowerShell 5.1 或更高版本
 - Google Chrome；仓库脚本只用 Chrome 打开报告，不会回退到 Edge
-- 百度地图 Web 服务 AK，可选；没有 AK 时仍可解析和排序，但新的线下地址不会计算实时路线
+- 高德或百度地图 Web 服务 Key，可选；没有所选供应商的 Key 时仍可解析和排序，但新的线下地址不会计算实时路线
 
 开发时验证过 Windows、Python 3.11 和 WeFlow 5.1.0。其他版本需要自行验证本地 API 的接口兼容性。
 
@@ -72,6 +72,7 @@ notepad .\config.local.json
 - `unsupported_subjects`：完全不接的科目，例如 `["化学"]`
 - `include_name_patterns`：用于匹配群名的正则表达式
 - `map_routing_enabled`：默认 `false`；只有确认允许地址外发后才改为 `true`
+- `map_provider`：选择 `amap` 或 `baidu`；示例配置使用高德
 - `origin_name`、`origin_coord`：仅启用地图时必填，坐标使用 GCJ-02 经度,纬度
 
 如果你已经合法配置好兼容 WeFlow 本地 API，先列出全部群聊到本地私有 CSV：
@@ -114,7 +115,7 @@ notepad .\config.local.json
 python .\ranker.py --input .\你的消息.md --date 2026-08-08 --out-dir .\work\manual-output --route-limit 0
 ```
 
-该命令只处理显式提供的文件。输出仍含聊天正文，示例把它放在已被 Git 忽略的 `work/` 下；不要提交或分享真实结果。输出 HTML 是简化排名页；实时 dashboard 功能请以合成演示为准。手动模式的地图上限默认也是 `0`；只有显式设为正数并配置百度 AK 时才会发送地址。
+该命令只处理显式提供的文件。输出仍含聊天正文，示例把它放在已被 Git 忽略的 `work/` 下；不要提交或分享真实结果。输出 HTML 是简化排名页；实时 dashboard 功能请以合成演示为准。手动模式的地图上限默认也是 `0`；只有显式设为正数、通过 `--map-provider amap|baidu` 选择供应商并配置对应 Key 时才会发送地址。
 
 ## 非默认 WeFlow 配置
 
@@ -140,13 +141,17 @@ python .\ranker.py --input .\你的消息.md --date 2026-08-08 --out-dir .\work\
 
 ## 地图通勤
 
-地图功能默认关闭。只有同时把 `map_routing_enabled` 改为 `true` 并设置环境变量密钥，程序才会把订单中的线下地址发送给百度地图地理编码和驾车路线服务。地址可能包含家庭或学校位置；开启即代表你确认有权向该第三方服务发送这些地址。
+地图功能默认关闭。只有同时把 `map_routing_enabled` 改为 `true`、通过 `map_provider` 选择供应商并设置对应环境变量密钥，程序才会把订单中的线下地址发送给所选地图服务。地址可能包含家庭或学校位置；开启即代表你确认有权向该第三方服务发送这些地址。程序不会因为请求失败或缺少 Key 而自动改用另一家供应商。
+
+新配置示例使用高德。先在高德开放平台创建服务平台为“Web 服务”的 Key，然后设置。实现使用高德官方的[地理编码 API](https://lbs.amap.com/api/webservice/guide/api/georegeo/)和[路径规划 2.0](https://lbs.amap.com/api/webservice/guide/api/newroute)驾车接口，并请求 `show_fields=cost` 以取得路线时长和费用字段：
 
 ```powershell
-[Environment]::SetEnvironmentVariable('BAIDU_MAP_AK', '你的百度地图AK', 'User')
+[Environment]::SetEnvironmentVariable('AMAP_KEY', '你的高德Web服务Key', 'User')
 ```
 
-重新打开 PowerShell 后运行 `.\check-setup.ps1`。`route_limit_per_run` 限制的是**每轮新线下地址数**，不是 HTTP 请求次数；每个新地址通常产生 1 次地理编码和 1 次路线请求，缓存命中及线上单不再调用地图 API。地图返回失败或额度耗尽时，订单仍会保留，通勤和净时薪可能为空或明确标为估算。
+若选择百度，把 `map_provider` 设为 `baidu`，并设置用户级 `BAIDU_MAP_AK`。为了兼容旧版，本地配置缺少 `map_provider` 时仍按百度处理，不会静默切换到高德。
+
+重新打开 PowerShell 后运行 `.\check-setup.ps1`，确认输出的 `map_provider` 和 `map_key_configured`。`route_limit_per_run` 限制的是**每轮新线下地址数**，不是 HTTP 请求次数；每个新地址通常产生 1 次地理编码和 1 次路线请求，缓存命中及线上单不再调用地图 API。路线和地理编码缓存均按供应商、出发地坐标和地址隔离。地图返回失败或额度耗尽时，订单仍会保留，通勤和净时薪可能为空或明确标为估算。
 
 ## 自动运行
 
@@ -175,7 +180,8 @@ Get-ScheduledTask -TaskName 'WeFlow Tutor Monitor'
 | `scan_interval_minutes` | 计划任务间隔，至少 15 分钟 |
 | `first_run_lookback_hours` | 第一次运行回看多少小时 |
 | `keep_leads_days` | 本地状态保留天数 |
-| `map_routing_enabled` | 是否允许把新线下地址发给百度地图，默认 `false` |
+| `map_routing_enabled` | 是否允许把新线下地址发给所选地图服务，默认 `false` |
+| `map_provider` | 地图供应商：`amap` 或 `baidu`；旧配置缺省为 `baidu` |
 | `route_limit_per_run` | 每轮地图新线下地址上限，不是 HTTP 次数 |
 | `subject_weights` | 科目匹配的基础分 |
 | `unsupported_subjects` | 命中后硬排除的科目 |
@@ -231,7 +237,7 @@ Get-ScheduledTask -TaskName 'WeFlow Tutor Monitor'
 
 **地图字段为空**
 
-确认 `map_routing_enabled=true`、GCJ-02 `origin_coord`、用户级 `BAIDU_MAP_AK` 和百度地图服务额度。地图不可用不会阻止无路线排序。
+确认 `map_routing_enabled=true`、GCJ-02 `origin_coord`、`map_provider` 以及对应的用户级 `AMAP_KEY` 或 `BAIDU_MAP_AK`。再到所选供应商控制台检查 Key 平台类型、权限、日额度和 QPS。地图不可用不会阻止无路线排序，也不会自动改用另一家供应商。
 
 **报告打开到了 Edge 或找不到浏览器**
 
